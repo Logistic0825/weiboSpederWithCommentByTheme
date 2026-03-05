@@ -19,15 +19,21 @@ from tqdm import tqdm
 from . import config_util, datetime_util
 from .downloader import AvatarPictureDownloader
 from .parser import AlbumParser, IndexParser, PageParser, PhotoParser
+from .weibo import Weibo
 from .parser.util import handle_html_async
 from .user import User
+from .writer.csv_writer import CsvWriter
+from .writer.jsonl_writer import JsonlWriter
 
 FLAGS = flags.FLAGS
 
 flags.DEFINE_string('config_path', None, 'The path to config.json.')
-flags.DEFINE_string('u', None, 'The user_id we want to input.')
-flags.DEFINE_string('user_id_list', None, 'The path to user_id_list.txt.')
+flags.DEFINE_string('keywords', None, 'Comma-separated keywords to search.')
+flags.DEFINE_string('keyword_list', None, 'The path to keywords txt file.')
 flags.DEFINE_string('output_dir', None, 'The dir path to store results.')
+flags.DEFINE_integer('keyword_concurrency', 1, 'Number of concurrent keyword tasks.')
+flags.DEFINE_integer('target_total_jsonl', 0, 'Stop after writing this many JSONL records; 0 means unlimited.')
+flags.DEFINE_boolean('require_comments', True, 'Only save posts that have at least one top comment.')
 
 logging_path = os.path.split(
     os.path.realpath(__file__))[0] + os.sep + 'logging.conf'
@@ -78,55 +84,31 @@ class Spider:
         self.kafka_config = config.get('kafka_config')
         self.mongo_config = config.get('mongo_config')
         self.post_config = config.get('post_config')
-        self.user_config_file_path = ''
-        user_id_list = config['user_id_list']
-        if FLAGS.user_id_list:
-            user_id_list = FLAGS.user_id_list
-        if not isinstance(user_id_list, list):
-            if not os.path.isabs(user_id_list):
-                user_id_list = os.getcwd() + os.sep + user_id_list
-            if not os.path.isfile(user_id_list):
-                logger.warning('不存在%s文件', user_id_list)
+        self.keyword_file_path = ''
+        keyword_list = config.get('keyword_list', [])
+        if FLAGS.keyword_list:
+            keyword_list = FLAGS.keyword_list
+        if not isinstance(keyword_list, list):
+            if not os.path.isabs(keyword_list):
+                keyword_list = os.getcwd() + os.sep + keyword_list
+            if not os.path.isfile(keyword_list):
+                logger.warning('不存在%s文件', keyword_list)
                 sys.exit()
-            self.user_config_file_path = user_id_list
-        if FLAGS.u:
-            user_id_list = FLAGS.u.split(',')
-        if isinstance(user_id_list, list):
-            # 第一部分是处理dict类型的
-            # 第二部分是其他类型,其他类型提供去重功能
-            user_config_list = list(
-                map(
-                    lambda x: {
-                        'user_uri': x['id'],
-                        'since_date': x.get('since_date', self.since_date),
-                        'end_date': x.get('end_date', self.end_date),
-                    }, [user_id for user_id in user_id_list
-                        if isinstance(user_id, dict)])) + list(
-                    map(
-                        lambda x: {
-                            'user_uri': x,
-                            'since_date': self.since_date,
-                            'end_date': self.end_date
-                        },
-                        set([
-                            user_id for user_id in user_id_list
-                            if not isinstance(user_id, dict)
-                        ])))
-            if FLAGS.u:
-                config_util.add_user_uri_list(self.user_config_file_path,
-                                              user_id_list)
-        else:
-            user_config_list = config_util.get_user_config_list(
-                user_id_list, self.since_date)
-            for user_config in user_config_list:
-                user_config['end_date'] = self.end_date
-        self.user_config_list = user_config_list  # 要爬取的微博用户的user_config列表
-        self.user_config = {}  # 用户配置,包含用户id和since_date
-        self.new_since_date = ''  # 完成某用户爬取后，自动生成对应用户新的since_date
-        self.user = User()  # 存储爬取到的用户信息
-        self.got_num = 0  # 存储爬取到的微博数
-        self.weibo_id_list = []  # 存储爬取到的所有微博id
-        self.session = None # aiohttp session
+            self.keyword_file_path = keyword_list
+            keyword_list = config_util.get_keyword_list(keyword_list)
+        if FLAGS.keywords:
+            keyword_list = FLAGS.keywords.split(',')
+        self.keyword_list = list(dict.fromkeys([k.strip() for k in keyword_list if k]))  # 去重并清理
+        self.got_num = 0
+        self.session = None
+        self.csv_writer = None
+        self.jsonl_writer = None
+        self.keyword_concurrency = FLAGS.keyword_concurrency
+        self.write_lock = None
+        self.total_saved_count = 0
+        self.total_jsonl_count = 0
+        self.target_total_jsonl = FLAGS.target_total_jsonl or 0
+        self.require_comments = FLAGS.require_comments
 
     async def write_weibo(self, weibos):
         """将爬取到的信息写入文件或数据库"""
@@ -158,87 +140,178 @@ class Spider:
             self._get_filepath('img'),
             self.file_download_timeout).handle_download(pic_urls, self.session)
 
-    async def get_weibo_info(self):
-        """获取微博信息"""
+    async def get_search_info(self, keyword):
+        """获取关键词搜索结果"""
         try:
-            since_date = datetime_util.str_to_time(
-                self.user_config['since_date'])
-            now = datetime.now()
-            if since_date <= now:
-                # Async fetch page num
-                user_uri = self.user_config['user_uri']
-                url = 'https://weibo.cn/%s/profile' % (user_uri)
-                selector = await handle_html_async(self.cookie, url, self.session)
-                page_num = IndexParser(self.cookie, user_uri, selector=selector).get_page_num()
-                
+            page = 1
+            empty_streak = 0
+            page1 = 0
+            random_pages = random.randint(*self.random_wait_pages)
+            while True:
+                url = f'https://m.weibo.cn/api/container/getIndex?containerid=100103type%3D1%26q%3D{keyword}&page_type=searchall&page={page}'
+                user_agent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/86.0.4240.111 Safari/537.36'
+                headers = {'User-Agent': user_agent, 'Cookie': self.cookie}
+                data = None
+                for _ in range(3):
+                    async with self.session.get(url, headers=headers) as resp:
+                        if resp.status != 200:
+                            await asyncio.sleep(1)
+                            continue
+                        try:
+                            data = await resp.json()
+                        except Exception:
+                            content = await resp.text()
+                            try:
+                                import json as _json
+                                data = _json.loads(content)
+                            except Exception:
+                                data = None
+                        if data:
+                            break
+                if not data or int(data.get('ok', 0)) != 1:
+                    empty_streak += 1
+                    if empty_streak >= 2:
+                        delay = 90
+                        logger.warning(u'关键词"%s"连续返回空结果/错误(ok!=1)，可能触发风控。将延时%d秒，请在浏览器完成验证以刷新 Cookie：%s',
+                                       keyword,
+                                       delay,
+                                       'https://passport.weibo.com/sso/signin?entry=wapsso&source=wapssowb&url=https://m.weibo.cn/')
+                        for i in tqdm(range(delay)):
+                            await asyncio.sleep(1)
+                        break
+                    page += 1
+                    continue
+                cards = data.get('data', {}).get('cards', [])
+                weibos = []
+                def _extract_mblogs(card):
+                    mblogs = []
+                    if card.get('mblog'):
+                        mblogs.append(card['mblog'])
+                    for group in card.get('card_group', []) or []:
+                        if group.get('mblog'):
+                            mblogs.append(group['mblog'])
+                    return mblogs
+                mblogs = []
+                for c in cards:
+                    mblogs.extend(_extract_mblogs(c))
+                if not mblogs:
+                    empty_streak += 1
+                    if empty_streak >= 2:
+                        delay = 90
+                        logger.warning(u'关键词"%s"连续空页(无搜索结果)，可能触发风控。将延时%d秒，请在浏览器完成验证以刷新 Cookie：%s',
+                                       keyword,
+                                       delay,
+                                       'https://passport.weibo.com/sso/signin?entry=wapsso&source=wapssowb&url=https://m.weibo.cn/')
+                        for i in tqdm(range(delay)):
+                            await asyncio.sleep(1)
+                        break
+                    page += 1
+                    continue
+                empty_streak = 0
+                for mb in mblogs:
+                    try:
+                        w = Weibo()
+                        w.id = str(mb.get('id') or mb.get('mid') or '')
+                        u = mb.get('user') or {}
+                        w.user_id = str(u.get('id') or '')
+                        w.author = u.get('screen_name') or ''
+                        w.keyword = keyword
+                        # 文本字段去标签
+                        text_html = mb.get('text') or ''
+                        try:
+                            from lxml import etree as _etree
+                            node = _etree.HTML('<div>%s</div>' % text_html)
+                            text_plain = node.xpath('string(.)') if node is not None else text_html
+                        except Exception:
+                            text_plain = text_html
+                        w.content = text_plain
+                        w.original = False if mb.get('retweeted_status') else True
+                        w.publish_time = mb.get('created_at') or ''
+                        w.publish_tool = mb.get('source') or ''
+                        w.up_num = int(mb.get('attitudes_count') or 0)
+                        w.retweet_num = int(mb.get('reposts_count') or 0)
+                        w.comment_num = int(mb.get('comments_count') or 0)
+                        pics = mb.get('pics') or []
+                        pic_urls = []
+                        for p in pics:
+                            url = p.get('url') or p.get('large', {}).get('url') or ''
+                            if url:
+                                pic_urls.append(url)
+                        w.original_pictures = ','.join(pic_urls) if pic_urls else '无'
+                        w.retweet_pictures = '无'
+                        page_info = mb.get('page_info') or {}
+                        media_info = page_info.get('media_info') or {}
+                        w.video_url = media_info.get('stream_url') or media_info.get('mp4_sd_url') or ''
+                        weibos.append(w)
+                    except Exception as e:
+                        logger.exception(e)
+                        continue
+                logger.info(u'%s已获取关键词"%s"的第%d页搜索结果%s',
+                            '-' * 30, keyword, page, '-' * 30)
+                yield page, weibos
                 self.page_count += 1
-                if self.page_count > 2 and (self.page_count +
-                                            page_num) > self.global_wait[0][0]:
-                    wait_seconds = int(
-                        self.global_wait[0][1] *
-                        min(1, self.page_count / self.global_wait[0][0]))
-                    logger.info(u'即将进入全局等待时间，%d秒后程序继续执行' % wait_seconds)
-                    for i in tqdm(range(wait_seconds)):
+                if (page - page1) % random_pages == 0:
+                    await asyncio.sleep(random.randint(*self.random_wait_seconds))
+                    page1 = page
+                    random_pages = random.randint(*self.random_wait_pages)
+                if self.page_count >= self.global_wait[0][0]:
+                    logger.info(u'即将进入全局等待时间，%d秒后程序继续执行' %
+                                self.global_wait[0][1])
+                    for i in tqdm(range(self.global_wait[0][1])):
                         await asyncio.sleep(1)
                     self.page_count = 0
                     self.global_wait.append(self.global_wait.pop(0))
-                page1 = 0
-                random_pages = random.randint(*self.random_wait_pages)
-                for page in tqdm(range(1, page_num + 1), desc='Progress'):
-                    # Get URL from parser without fetching
-                    parser_temp = PageParser(
-                        self.cookie,
-                        self.user_config, page, self.filter, defer_fetch=True)
-                    
-                    # Async fetch with retry
-                    selector = None
-                    for _ in range(3):
-                        selector = await handle_html_async(self.cookie, parser_temp.url, self.session)
-                        if selector is not None:
-                             info = selector.xpath("//div[@class='c']")
-                             if info and len(info) > 0:
-                                 break
-                    
-                    parser = PageParser(self.cookie, self.user_config, page, self.filter, selector=selector)
-                    
-                    weibos, self.weibo_id_list, to_continue = parser.get_one_page(self.weibo_id_list)
-                    
-                    logger.info(
-                        u'%s已获取%s(%s)的第%d页微博%s',
-                        '-' * 30,
-                        self.user.nickname,
-                        self.user.id,
-                        page,
-                        '-' * 30,
-                    )
-                    self.page_count += 1
-                    if weibos:
-                        yield weibos
-                    if not to_continue:
-                        break
-
-                    if (page - page1) % random_pages == 0 and page < page_num:
-                        await asyncio.sleep(random.randint(*self.random_wait_seconds))
-                        page1 = page
-                        random_pages = random.randint(*self.random_wait_pages)
-
-                    if self.page_count >= self.global_wait[0][0]:
-                        logger.info(u'即将进入全局等待时间，%d秒后程序继续执行' %
-                                    self.global_wait[0][1])
-                        for i in tqdm(range(self.global_wait[0][1])):
-                            await asyncio.sleep(1)
-                        self.page_count = 0
-                        self.global_wait.append(self.global_wait.pop(0))
-
-                if self.user_config_file_path or FLAGS.u:
-                    config_util.update_user_config_file(
-                        self.user_config_file_path,
-                        self.user_config['user_uri'],
-                        self.user.nickname,
-                        self.new_since_date,
-                    )
+                page += 1
         except Exception as e:
             logger.exception(e)
+
+    async def fetch_top_comments(self, weibo_id):
+        """获取微博第一页一级评论"""
+        try:
+            url = f'https://m.weibo.cn/comments/hotflow?id={weibo_id}&mid={weibo_id}'
+            user_agent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/86.0.4240.111 Safari/537.36'
+            headers = {'User-Agent': user_agent, 'Cookie': self.cookie}
+            async with self.session.get(url, headers=headers) as resp:
+                if resp.status != 200:
+                    return []
+                data = None
+                try:
+                    data = await resp.json()
+                except Exception:
+                    text = await resp.text()
+                    try:
+                        import json as _json
+                        data = _json.loads(text)
+                    except Exception:
+                        return []
+            comments = []
+            nodes = ((data or {}).get('data') or {}).get('data') or []
+            for c in nodes:
+                try:
+                    cid = str(c.get('id') or '')
+                    user = (c.get('user') or {}).get('screen_name') or ''
+                    text_html = c.get('text') or ''
+                    try:
+                        from lxml import etree as _etree
+                        node = _etree.HTML('<div>%s</div>' % text_html)
+                        content = node.xpath('string(.)') if node is not None else text_html
+                    except Exception:
+                        content = text_html
+                    likes = int(c.get('like_count') or 0)
+                    comments.append({
+                        'original_post_id': weibo_id,
+                        'comment_id': cid,
+                        'user': user,
+                        'content': content,
+                        'likes': likes,
+                    })
+                except Exception as e:
+                    logger.exception(e)
+                    continue
+            return comments
+        except Exception as e:
+            logger.exception(e)
+            return []
 
     def _get_filepath(self, type):
         """获取结果文件路径"""
@@ -257,6 +330,22 @@ class Spider:
             if type == 'img' or type == 'video':
                 return file_dir
             file_path = file_dir + os.sep + self.user.id + '.' + type
+            return file_path
+        except Exception as e:
+            logger.exception(e)
+
+    def _get_search_filepath(self, type, keyword, page):
+        """获取搜索结果文件路径"""
+        try:
+            # Deprecated: 分页面路径，聚合化后不再使用
+            dir_name = keyword
+            if FLAGS.output_dir is not None:
+                file_dir = FLAGS.output_dir + os.sep + dir_name
+            else:
+                file_dir = (os.getcwd() + os.sep + 'weibo' + os.sep + dir_name)
+            if not os.path.isdir(file_dir):
+                os.makedirs(file_dir)
+            file_path = file_dir + os.sep + f'search_results_page{page}.{type}'
             return file_path
         except Exception as e:
             logger.exception(e)
@@ -328,53 +417,90 @@ class Spider:
                 VideoDownloader(self._get_filepath('video'),
                                 self.file_download_timeout))
 
-    async def get_one_user(self, user_config):
-        """获取一个用户的微博"""
+    async def get_one_keyword(self, keyword):
+        """获取一个关键词的搜索结果"""
         try:
-            await self.get_user_info(user_config['user_uri'])
-            logger.info(self.user)
-            logger.info('*' * 100)
-
-            self.initialize_info(user_config)
-            self.write_user(self.user)
-            logger.info('*' * 100)
-
-            # 下载用户头像相册中的图片。
-            if self.pic_download:
-                await self.download_user_avatar(user_config['user_uri'])
-
-            async for weibos in self.get_weibo_info():
-                await self.write_weibo(weibos)
+            async for page, weibos in self.get_search_info(keyword):
+                pairs = []
+                for wb in weibos:
+                    top_comments = await self.fetch_top_comments(wb.id)
+                    pairs.append((wb, top_comments))
+                weibos_filtered = [wb for wb, cs in pairs if (cs if self.require_comments else True)]
+                if self.csv_writer and weibos_filtered:
+                    async with self.write_lock:
+                        self.csv_writer.write_weibo(weibos_filtered)
+                        self.total_saved_count += len(weibos_filtered)
+                if self.jsonl_writer:
+                    records = []
+                    for wb, cs in pairs:
+                        if self.require_comments and not cs:
+                            continue
+                        records.append({
+                            'keyword': keyword,
+                            'weibo_details': {
+                                'id': wb.id,
+                                'text': wb.content,
+                                'author': wb.author,
+                                'stats': {'up': wb.up_num, 're': wb.retweet_num, 'cm': wb.comment_num},
+                            },
+                            'top_comments': cs if cs else []
+                        })
+                    if records:
+                        async with self.write_lock:
+                            self.jsonl_writer.write_weibo(records)
+                            self.total_jsonl_count += len(records)
+                if self.target_total_jsonl and self.total_jsonl_count >= self.target_total_jsonl:
+                    logger.info(u'已达到目标JSONL条数（%d），停止当前关键词抓取', self.target_total_jsonl)
+                    break
                 self.got_num += len(weibos)
-            if not self.filter:
-                logger.info(u'共爬取' + str(self.got_num) + u'条微博')
-            else:
-                logger.info(u'共爬取' + str(self.got_num) + u'条原创微博')
-            logger.info(u'信息抓取完毕')
-            logger.info('*' * 100)
+            logger.info(u'关键词"%s"共爬取%d条微博', keyword, self.got_num)
+            logger.info(u'关键词"%s"信息抓取完毕', keyword)
         except Exception as e:
             logger.exception(e)
-
     async def start(self):
         """运行爬虫"""
         try:
-            if not self.user_config_list:
-                logger.info(
-                    u'没有配置有效的user_id，请通过config.json或user_id_list.txt配置user_id')
+            if not self.keyword_list:
+                logger.info(u'没有配置有效的关键词，请通过config.json或keywords.txt配置keyword_list或通过命令行传入 --keywords')
                 return
-            
             async with aiohttp.ClientSession() as session:
                 self.session = session
-                user_count = 0
-                user_count1 = random.randint(*self.random_wait_pages)
-                random_users = random.randint(*self.random_wait_pages)
-                for user_config in self.user_config_list:
-                    if (user_count - user_count1) % random_users == 0:
-                        await asyncio.sleep(random.randint(*self.random_wait_seconds))
-                        user_count1 = user_count
-                        random_users = random.randint(*self.random_wait_pages)
-                    user_count += 1
-                    await self.get_one_user(user_config)
+                # 初始化聚合写入器
+                base_out = os.getcwd() + os.sep + 'output'
+                if not os.path.isdir(base_out):
+                    os.makedirs(base_out)
+                self.write_lock = asyncio.Lock()
+                if 'csv' in self.write_mode:
+                    self.csv_writer = CsvWriter(base_out + os.sep + 'all_weibo_results.csv', self.filter)
+                if 'jsonl' in self.write_mode or 'json' in self.write_mode:
+                    self.jsonl_writer = JsonlWriter(base_out + os.sep + 'all_weibo_with_comments.jsonl')
+                if self.keyword_concurrency and self.keyword_concurrency > 1:
+                    sem = asyncio.Semaphore(self.keyword_concurrency)
+                    async def _run(k):
+                        async with sem:
+                            await self.get_one_keyword(k)
+                    tasks = [asyncio.create_task(_run(k)) for k in self.keyword_list]
+                    await asyncio.gather(*tasks)
+                else:
+                    kw_count = 0
+                    kw_count1 = random.randint(*self.random_wait_pages)
+                    random_kws = random.randint(*self.random_wait_pages)
+                    for keyword in self.keyword_list:
+                        if self.target_total_jsonl and self.total_jsonl_count >= self.target_total_jsonl:
+                            break
+                        if (kw_count - kw_count1) % random_kws == 0:
+                            await asyncio.sleep(random.randint(*self.random_wait_seconds))
+                            kw_count1 = kw_count
+                            random_kws = random.randint(*self.random_wait_pages)
+                        kw_count += 1
+                        await self.get_one_keyword(keyword)
+                if self.total_saved_count == 0:
+                    delay = 120
+                    logger.warning(u'未抓取到任何内容，可能触发风控或需要人机验证。将延时%d秒，请在浏览器完成登录/验证以刷新 Cookie：%s',
+                                   delay,
+                                   'https://passport.weibo.com/sso/signin?entry=wapsso&source=wapssowb&url=https://m.weibo.cn/')
+                    for i in tqdm(range(delay)):
+                        await asyncio.sleep(1)
         except Exception as e:
             logger.exception(e)
 
@@ -411,7 +537,7 @@ async def async_main(_):
         config = _get_config()
         config_util.validate_config(config)
         wb = Spider(config)
-        await wb.start()  # 爬取微博信息
+        await wb.start()
     except Exception as e:
         logger.exception(e)
 

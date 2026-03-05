@@ -1,6 +1,6 @@
 class Weibo:
     __slots__ = (
-        'id', 'user_id', 'content', 'article_url', 'original_pictures',
+        'id', 'user_id', 'keyword', 'author', 'content', 'article_url', 'original_pictures',
         'retweet_pictures', 'original', 'video_url', 'original_pictures_list',
         'retweet_pictures_list', 'media', 'publish_place', 'publish_time',
         'publish_tool', 'up_num', 'retweet_num', 'comment_num'
@@ -13,6 +13,8 @@ class Weibo:
     def __init__(self):
         self.id = ''
         self.user_id = ''
+        self.keyword = ''
+        self.author = ''
         self.content = ''
         self.article_url = ''
         self.original_pictures = []

@@ -4,7 +4,7 @@
 
 # Weibo Spider
 
-本程序可以连续爬取**一个**或**多个**新浪微博用户（如[胡歌](https://weibo.cn/u/1223178222)、[迪丽热巴](https://weibo.cn/u/1669879400)、[郭碧婷](https://weibo.cn/u/1729370543)）的数据，并将结果信息写入**文件**或**数据库**。写入信息几乎包括用户微博的所有数据，包括**用户信息**和**微博信息**两大类。因为内容太多，这里不再赘述，详细内容见[获取到的字段](#获取到的字段)。如果只需要用户信息，可以通过设置实现只爬取微博用户信息的功能。本程序需设置cookie来获取微博访问权限，后面会讲解[如何获取cookie](#如何获取cookie)。如果不想设置cookie，可以使用[免cookie版](https://github.com/dataabc/weibo-crawler)，二者功能类似。
+本程序支持根据关键词/主题连续爬取微博数据（如“人工智能”“大模型”），并将结果信息写入**文件**或**数据库**。抓取基于移动端搜索接口，能够提取出博主昵称、微博正文、发布时间、点赞/转发/评论数等核心字段。需设置cookie来获取访问权限，详见[如何获取cookie](#如何获取cookie)。
 
 爬取结果可写入文件和数据库，具体的写入文件类型如下：
 
@@ -94,9 +94,9 @@
 - 转发数：微博被转发的数量
 - 评论数：微博被评论的数量
 - 微博发布工具：微博的发布工具，如iPhone客户端、HUAWEI Mate 20 Pro等
-- 结果文件：保存在当前目录weibo文件夹下以用户昵称为名的文件夹里，名字为"user_id.csv"和"user_id.txt"的形式
-- 微博图片：原创微博中的图片和转发微博转发理由中的图片，保存在以用户昵称为名的文件夹下的img文件夹里
-- 微博视频：原创微博中的视频，保存在以用户昵称为名的文件夹下的video文件夹里
+- 结果文件：保存在当前目录weibo/关键词/目录下，文件名为“search_results_pageN.csv|txt|json”，按页拆分
+- 微博图片：保存在weibo/关键词/img目录（如启用下载）
+- 微博视频：保存在weibo/关键词/video目录（如启用下载）
 - 微博bid（免cookie版）：为[免cookie版](https://github.com/dataabc/weibo-crawler)所特有，与本程序中的微博id是同一个值
 - 话题（免cookie版）：微博话题，即两个#中的内容，若存在多个话题，每个url以英文逗号分隔，若没有则值为''
 - @用户（免cookie版）：微博@的用户，若存在多个@用户，每个url以英文逗号分隔，若没有则值为''
@@ -147,7 +147,7 @@ $ python3 -m pip install weibo-spider
 $ python3 -m weibo_spider
 ```
 
-第一次执行，会自动在当前目录创建config.json配置文件，配置好后执行同样的命令就可以获取微博了。
+第一次执行，会自动在当前目录创建config.json配置文件；配置好关键词后执行同样的命令即可获取搜索结果。
 
 如果你已经有config.json文件了，也可以通过config_path参数配置config.json路径，运行程序，命令行如下：
 
@@ -161,13 +161,13 @@ $ python3 -m weibo_spider --config_path="config.json"
 $ python3 -m weibo_spider --output_dir="/home/weibo/"
 ```
 
-如果你想通过命令行输入user_id，可以使用参数u，可以输入一个或多个user_id，每个user_id以英文逗号分开，如果这些user_id中有重复的user_id，程序会自动去重。命令行如下：
+如果你想通过命令行输入关键词，可以使用参数keywords，可以输入一个或多个关键词，每个关键词以英文逗号分开。命令行如下：
 
 ```bash
-$ python3 -m weibo_spider --u="1669879400,1223178222"
+$ python3 -m weibo_spider --keywords="人工智能,大模型"
 ```
 
-程序会获取user_id分别为1669879400和1223178222的微博用户的微博，后面会讲[如何获取user_id](#如何获取user_id)。该方式的所有user_id使用config.json中的since_date和end_date设置，通过修改它们的值可以控制爬取的时间范围。若config.json中的user_id_list是文件路径，每个命令行中的user_id都会自动保存到该文件内，且自动更新since_date；若不是路径，user_id会保存在当前目录的user_id_list.txt内，且自动更新since_date，若当前目录下不存在user_id_list.txt，程序会自动创建它。
+程序会获取“人工智能”“大模型”等关键词的搜索结果。也可以在config.json中通过keyword_list字段配置关键词，支持直接写列表或提供一个txt路径（每行一个关键词）。
 
 ## 个性化定制程序（可选）
 
@@ -232,10 +232,76 @@ $ python3 -m weibo_spider --u="1669879400,1223178222"
 
 要了解获取cookie方法，请查看[cookie文档](https://github.com/dataabc/weiboSpider/blob/master/docs/cookie.md)。
 
-## 如何获取user_id
+## 关键词配置
 
-要了解获取user_id方法，请查看[user_id文档](https://github.com/dataabc/weiboSpider/blob/master/docs/userid.md)，该文档介绍了如何获取一个及多个微博用户user_id的方法。
+在config.json中将keyword_list设置为关键词列表或txt路径，例如：
 
+```json
+{
+  "keyword_list": ["人工智能", "大模型"]
+}
+```
+
+或：
+
+```json
+{
+  "keyword_list": "keywords.txt"
+}
+```
+keywords.txt文件每行一个关键词。
+
+## 数据存储说明 (Data Storage)
+
+- 全局唯一 CSV 汇总文件：程序运行期间，所有抓取到的微博数据均追加写入 output/all_weibo_results.csv。首次写入会自动创建并写入表头，后续运行仅追加数据行，避免重复写入表头。
+- JSON Lines 文件：新增 output/all_weibo_with_comments.jsonl，以一行一个 JSON 记录的方式流式写入微博及其一级评论的嵌套结构，避免大文件加载失败并便于下游管道处理。
+
+## 数据字典 (Data Dictionary)
+
+CSV 字段示例：
+
+| 字段 | 说明 |
+| --- | --- |
+| keyword | 搜索关键词 |
+| id | 微博id |
+| content | 微博正文 |
+| article_url | 头条文章url |
+| original_pictures | 原始图片url列表（逗号分隔） |
+| video_url | 视频url |
+| publish_place | 发布位置 |
+| publish_time | 发布时间 |
+| publish_tool | 发布工具 |
+| up_num | 点赞数 |
+| retweet_num | 转发数 |
+| comment_num | 评论数 |
+
+JSONL 单行嵌套结构示例：
+
+```json
+{
+  "keyword": "人工智能",
+  "weibo_details": {
+    "id": "5273208732254281",
+    "text": "正文文本",
+    "author": "昵称",
+    "stats": { "up": 10, "re": 5, "cm": 2 }
+  },
+  "top_comments": [
+    {
+      "original_post_id": "5273208732254281",
+      "comment_id": "4790012345678",
+      "user": "评论者昵称",
+      "content": "评论内容",
+      "likes": 5
+    }
+  ]
+}
+```
+
+## 评论抓取配置 (Comment Settings)
+
+- 默认策略：每条微博仅抓取第一页的一级评论（接口：m.weibo.cn/comments/hotflow?id={id}&mid={id}）。
+- 反爬提示：评论接口可能返回错误或空数据；已内置重试与容错。建议在 config.json 中适当提高 random_wait_seconds 以降低触发风控的概率。
 ## 常见问题
 
 如果运行程序的过程中出现错误，可以查看[常见问题](https://github.com/dataabc/weiboSpider/blob/master/docs/FAQ.md)页面，里面包含了最常见的问题及解决方法。另一方面，由于当前项目所使用的技术或API的局限性，我们已知某些情况无法处理或某些需求无法实现，已将其整理总结在了[已知问题](https://github.com/dataabc/weiboSpider/blob/master/docs/known_issues.md)。除此之外，如果您在程序使用过程中遇到与预期不符的行为，可以通过[发issue](https://github.com/dataabc/weiboSpider/issues/new/choose)寻求帮助，我们会很乐意为您解答。
@@ -272,3 +338,4 @@ $ python3 -m weibo_spider --u="1669879400,1223178222"
 
 1. user_id不能为爬虫微博的user_id。因为要爬微博信息，必须先登录到某个微博账号，此账号我们姑且称为爬虫微博。爬虫微博访问自己的页面和访问其他用户的页面，得到的网页格式不同，所以无法爬取自己的微博信息；如果想要爬取爬虫微博内容，可以参考[获取自身微博信息](https://github.com/dataabc/weiboSpider/issues/113)；
 2. cookie有期限限制，大约三个月。若提示cookie错误或已过期，需要重新更新cookie。
+# weiboSpederWithCommentByTheme

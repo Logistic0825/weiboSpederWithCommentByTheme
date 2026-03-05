@@ -87,7 +87,7 @@ def validate_config(config):
                 sys.exit()
 
     # 验证write_mode
-    write_mode = ['txt', 'csv', 'json', 'mongo', 'mysql', 'sqlite', 'kafka','post']
+    write_mode = ['txt', 'csv', 'json', 'jsonl', 'mongo', 'mysql', 'sqlite', 'kafka','post']
     if not isinstance(config['write_mode'], list):
         logger.warning(u'write_mode值应为list类型')
         sys.exit()
@@ -98,17 +98,19 @@ def validate_config(config):
                 mode)
             sys.exit()
 
-    # 验证user_id_list
-    user_id_list = config['user_id_list']
-    if (not isinstance(user_id_list,
-                       list)) and (not user_id_list.endswith('.txt')):
-        logger.warning(u'user_id_list值应为list类型或txt文件路径')
+    # 验证keyword_list
+    keyword_list = config.get('keyword_list')
+    if keyword_list is None:
+        logger.warning(u'缺少keyword_list配置，请在config.json中添加关键词列表或txt路径')
         sys.exit()
-    if not isinstance(user_id_list, list):
-        if not os.path.isabs(user_id_list):
-            user_id_list = os.getcwd() + os.sep + user_id_list
-        if not os.path.isfile(user_id_list):
-            logger.warning(u'不存在%s文件', user_id_list)
+    if (not isinstance(keyword_list, list)) and (not str(keyword_list).endswith('.txt')):
+        logger.warning(u'keyword_list值应为list类型或txt文件路径')
+        sys.exit()
+    if not isinstance(keyword_list, list):
+        if not os.path.isabs(keyword_list):
+            keyword_list = os.getcwd() + os.sep + keyword_list
+        if not os.path.isfile(keyword_list):
+            logger.warning(u'不存在%s文件', keyword_list)
             sys.exit()
 
 
@@ -137,6 +139,18 @@ def get_user_config_list(file_name, default_since_date):
                 if user_config not in user_config_list:
                     user_config_list.append(user_config)
     return user_config_list
+
+def get_keyword_list(file_name):
+    """获取文件中的关键词列表"""
+    with open(file_name, 'rb') as f:
+        try:
+            lines = f.read().splitlines()
+            lines = [line.decode('utf-8-sig').strip() for line in lines]
+        except UnicodeDecodeError:
+            logger.error(u'%s文件应为utf-8编码，请先将文件编码转为utf-8再运行程序', file_name)
+            sys.exit()
+        keywords = [line for line in lines if line]
+    return keywords
 
 
 def update_user_config_file(user_config_file_path, user_uri, nickname,
