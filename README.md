@@ -27,6 +27,13 @@
     - 文章字段：keyword、weibo_id、article_text、author、up/re/cm
     - 评论字段：original_post_id、comment_id、user、content、likes、AI 判别（四项）、truncated、sensitive_hits
 
+- 将“清洗前（原始）数据”导出为同格式 Excel：
+  ```bash
+  pip install datasets openpyxl
+  python convert_dataset_to_xlsx.py
+  ```
+  - 输出为 `output/raw_weibo.xlsx`，工作表结构与清洗后的 `cleaned_weibo.xlsx` 一致
+
 ## 清洗规则与实现映射
 ### 一、基础过滤
 - 空值与重复：
