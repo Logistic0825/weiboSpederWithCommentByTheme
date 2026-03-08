@@ -15,6 +15,18 @@
   }
   ```
 
+## 导出为 XLSX
+- 将 `output/cleaned_weibo.jsonl` 转为 Excel：
+  ```bash
+  pip install openpyxl
+  python convert_jsonl_to_xlsx.py output/cleaned_weibo.jsonl output/cleaned_weibo.xlsx
+  ```
+- 生成两张工作表：
+  - articles：keyword、weibo_id、text、author、up/re/cm、comments_count、cleaned_comments_count
+  - comments：每行一条评论，并包含对应文章字段
+    - 文章字段：keyword、weibo_id、article_text、author、up/re/cm
+    - 评论字段：original_post_id、comment_id、user、content、likes、AI 判别（四项）、truncated、sensitive_hits
+
 ## 清洗规则与实现映射
 ### 一、基础过滤
 - 空值与重复：
