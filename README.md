@@ -15,24 +15,65 @@
   }
   ```
 
-## 导出为 XLSX
-- 将 `output/cleaned_weibo.jsonl` 转为 Excel：
-  ```bash
-  pip install openpyxl
-  python convert_jsonl_to_xlsx.py output/cleaned_weibo.jsonl output/cleaned_weibo.xlsx
-  ```
-- 生成两张工作表：
-  - articles：keyword、weibo_id、text、author、up/re/cm、comments_count、cleaned_comments_count
-  - comments：每行一条评论，并包含对应文章字段
-    - 文章字段：keyword、weibo_id、article_text、author、up/re/cm
-    - 评论字段：original_post_id、comment_id、user、content、likes、AI 判别（四项）、truncated、sensitive_hits
+## 指标与删除原因解释大全
+- 关键计数含义
+  - 原始样本数：数据集中原始文章条数
+  - 文章去重后样本数：按微博ID严格去重后的文章条数
+  - 最终样本数：清洗流程结束后保留的文章条数
+  - 原始评论数：所有文章的原始评论总数
+  - 评论精确去重后：清洗后（近似去重前）的评论条数
+  - 清洗后评论数(去重前)：规则清洗完成后、近似去重之前的评论条数
+  - 清洗后评论数(最终)：规则清洗 + 近似去重后的评论条数
+  - 文章重复删除数：重复文章（ID相同）删除的数量
+  - 文章时间不在范围删除数：发布时间不在设定范围内的文章删除数量（默认 2025-01-01 至 2026-03-01）
+  - 文章空评论删除数：清洗后没有有效评论的文章删除数量（仅在开启该选项时）
+  - 评论ID重复删除数：同一文章内，评论ID重复删除的数量
+  - 评论精确重复删除数：同一文章内，文本完全相同（规范化后）评论删除数量
+  - 评论近似重复删除数：同一文章内，相似度≥0.9 的评论删除数量
+  - 截断评论数：长度超过截断阈值（默认500）被截断的评论数量
+  - AI判别调用次数：清洗过程中触发 AI 判别的次数
 
-- 将“清洗前（原始）数据”导出为同格式 Excel：
-  ```bash
-  pip install datasets openpyxl
-  python convert_dataset_to_xlsx.py
-  ```
-  - 输出为 `output/raw_weibo.xlsx`，工作表结构与清洗后的 `cleaned_weibo.xlsx` 一致
+- 删除原因键说明（dropped_reasons）
+  - exact_dup：精确重复（规范化后文本完全相同）删除
+  - too_short：过短删除（原始或清洗后有效长度不足 5）
+  - empty：空文本删除（规范化后为空）
+  - meaningless_rule：无意义文本删除（纯数字/重复“哈哈”等/低字符多样性）
+  - pure_punct_emoji：纯标点或纯表情删除
+  - ad_spam_rule：广告垃圾（手机号/QQ/微信/URL/淘口令等）命中删除
+  - too_long_drop：超长删除（超过1000字）
+  - near_dup：近似重复删除（相似度≥0.9）
+  - ai_ad_spam：AI 判定为广告后删除
+  - ai_meaningless：AI 判定为无意义后删除
+  - ai_sensitive：AI 判定为敏感后删除（在允许删除敏感内容时）
+
+- 删除样本明细（dropped_examples）
+  - 根层 dropped_examples：聚合所有分片的删除样本明细，按原因分组
+  - 分片层 metrics.splits.<split>.dropped_examples：该分片内的删除样本明细
+  - 每条明细包含：original_post_id、comment_id、user、likes、content_orig、content_norm、reason，还可能包含 sensitive_hits
+
+- 两处 dropped_examples 的原因
+  - 为了同时支持“全局分析”和“分片对比”，指标 JSON 在根层和分片层都保留删除样本明细对象；两者位于不同层级，不是重复键
+
+## 导出与对比（内置于 clean_weibo.py）
+- 清洗入口会自动导出两份 Excel 到 output：
+  - cleaned_weibo.xlsx（清洗后）
+    - articles：关键词、微博ID、微博正文、完整正文、作者、点赞数、转发数、评论数、原评论条数、清洗后评论条数、发布时间
+    - comments：每行一条“清洗后保留”的评论，含文章字段与清洗标记
+      - 评论字段：原微博ID、评论ID、评论用户、评论内容、评论点赞
+      - 清洗标记：AI广告、AI无意义、AI敏感、机器水军、是否截断、敏感命中
+      - 说明：清洗后保留的评论通常不再命中删除原因，因此这些标记大多为 False
+  - raw_weibo.xlsx（清洗前）
+    - articles 同上
+    - comments：每行一条“原始”评论，含文章字段与下列标注
+      - 评论字段同上
+      - 清洗标记（来自清洗过程的映射）：AI广告、AI无意义、AI敏感、机器水军、是否截断、敏感命中
+      - 新增标注：是否被清洗、被清洗原因（多原因逗号分隔，如 exact_dup, near_dup, too_short, ad_spam_rule, ai_sensitive, article_time, article_dup）
+        - article_time：文章时间不在设定范围，整篇文章被删除
+        - article_dup：文章ID重复，整篇文章被删除
+    - 作用：用于“事后复核”，哪条原始评论在清洗后被删除、因何原因删除，一目了然
+  - 覆盖流式与非流式模式；可用下列参数定制导出路径：
+    - --export-clean-xlsx output/cleaned_weibo.xlsx
+    - --export-raw-xlsx output/raw_weibo.xlsx
 
 ## 清洗规则与实现映射
 ### 一、基础过滤
@@ -70,7 +111,7 @@
 - Python ≥ 3.9
 - 安装依赖：
   ```bash
-  pip install datasets openai
+  pip install datasets "openai>=1.0.0"
   ```
   如需中文分词：`pip install jieba`
 
@@ -84,6 +125,27 @@
   ```bash
   OUTPUT_PATH=output/weibo_clean.jsonl python clean_weibo.py
   ```
+- 离线/网络不稳定（本地JSONL回退）：
+  - 若访问 HuggingFace 失败，可指定本地原始 JSONL：
+    ```bash
+    python clean_weibo.py --input-jsonl output/raw_weibo.jsonl
+    ```
+  - 流式模式也会实时写出原始 JSONL：`--raw-output output/raw_weibo.jsonl`
+
+### 3. 启用 AI 判别（必要配置）
+- 在项目根目录创建 .env 文件（不提交到仓库），内容例如：
+  ```bash
+  OPENAI_API_KEY=sk-xxxxxxxx
+  # 如使用官方 OpenAI：可不设置 GPTS_BASE_URL（默认 https://api.openai.com/v1）
+  # 如使用第三方网关：设置 GPTS_BASE_URL=https://api.gptsapi.net/v1
+  GPTS_MODEL=gpt-4o-mini
+  AI_ENABLE=true
+  AI_SAMPLE_RATE=1.0
+  ```
+- 运行时 run_clean.sh 会自动加载 .env；若未检测到 API Key，会输出警告并跳过 AI 判别
+- AI 触发条件（默认）：
+  - 仅在命中敏感词时调用（`--ai-on-sensitive-only true`）
+  - 删除敏感仅在 AI 判定为敏感且允许删除时（`--drop-sensitive true`）
 
 ### 3. AI 判别
 - 脚本会在检测到环境变量后启用 AI 兜底判别：
@@ -114,6 +176,17 @@
    - 控制台打印：样本原始/去重后/最终、评论计数、近似重复移除、截断数、AI 调用次数
    - 安装 `tqdm` 会显示进度条与关键指标后缀
    - 结束时打印三张表（Markdown）：`summary_table_markdown`、`splits_table_markdown`、`reason_table_markdown`
+
+### 5. 时间过滤参数
+- 通过 CLI 控制文章时间范围（含边界，按 +08:00 计算）：
+  ```bash
+  python clean_weibo.py \
+    --time-filter-enable true \
+    --start-date 2025-01-01 \
+    --end-date 2026-03-31
+  ```
+- 若不需要时间过滤：`--time-filter-enable false`
+- 默认为 `2025-01-01` 到 `2027-06-01`
 
 ### 4. 可配置项
 - 在 `DEFAULT_SETTINGS` 中可调整：
@@ -146,6 +219,9 @@
   - 封装调用与 JSON 返回解析：[ai_classify](file:///Users/logistic/Documents/AI/LLM/project/weibo_dataset_clean/clean_weibo.py#L133-L163)
   - 删除策略：仅当 AI 判定为敏感时删除（`ai_sensitive`），词表仅做标注：[clean_comment](file:///Users/logistic/Documents/AI/LLM/project/weibo_dataset_clean/clean_weibo.py#L166-L227)
   - 环境变量：`GPTS_API_KEY`/`OPENAI_API_KEY`、`GPTS_BASE_URL`（默认 `https://api.gptsapi.net/v1`）、`GPTS_MODEL`（默认 `gpt-4o-mini`）
+- 导出
+  - JSONL→XLSX 导出内置于入口：[export_jsonl_to_xlsx](file:///Users/logistic/Documents/AI/LLM/project/weibo_dataset_clean/clean_weibo.py#L180-L280)
+  - raw_weibo.xlsx 注入清洗映射（AI标记与“是否被清洗/原因”）；cleaned_weibo.xlsx 展示清洗后保留评论
 - 去重算法
   - 近似重复：`difflib.SequenceMatcher` 相似度≥0.9 判为重复；仅比较最近 50 条以兼顾性能：[dedupe_comments](file:///Users/logistic/Documents/AI/LLM/project/weibo_dataset_clean/clean_weibo.py#L230-L253)
 - 指标统计
@@ -174,6 +250,7 @@
   - 清洗结果：`output/cleaned_weibo.jsonl` 每行一个样本，含 `cleaned_top_comments`
   - 指标 JSON（简化示例）：
     ```json
+    {
     {
       "total_examples": 123,
       "total_comments_before": 4567,
