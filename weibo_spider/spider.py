@@ -10,6 +10,8 @@ import shutil
 import sys
 import asyncio
 import aiohttp
+import re
+import html
 from datetime import date, datetime, timedelta
 from time import sleep
 
@@ -109,6 +111,15 @@ class Spider:
         self.total_jsonl_count = 0
         self.target_total_jsonl = FLAGS.target_total_jsonl or 0
         self.require_comments = FLAGS.require_comments
+        jitter = config.get('per_request_jitter_seconds', [0, 0])
+        self.per_request_jitter_seconds = [min(jitter), max(jitter)]
+        self.proxies = config.get('proxies') or []
+        self.rotate_on_block = bool(config.get('rotate_on_block', True))
+        self.proxy_index = -1
+        self.current_proxy = None
+        if self.proxies:
+            self.proxy_index = 0
+            self.current_proxy = self.proxies[0]
 
     async def write_weibo(self, weibos):
         """将爬取到的信息写入文件或数据库"""
@@ -148,12 +159,14 @@ class Spider:
             page1 = 0
             random_pages = random.randint(*self.random_wait_pages)
             while True:
+                if sum(self.per_request_jitter_seconds) > 0:
+                    await asyncio.sleep(random.uniform(*self.per_request_jitter_seconds))
                 url = f'https://m.weibo.cn/api/container/getIndex?containerid=100103type%3D1%26q%3D{keyword}&page_type=searchall&page={page}'
                 user_agent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/86.0.4240.111 Safari/537.36'
                 headers = {'User-Agent': user_agent, 'Cookie': self.cookie}
                 data = None
                 for _ in range(3):
-                    async with self.session.get(url, headers=headers) as resp:
+                    async with self.session.get(url, headers=headers, proxy=self.current_proxy) as resp:
                         if resp.status != 200:
                             await asyncio.sleep(1)
                             continue
@@ -171,14 +184,15 @@ class Spider:
                 if not data or int(data.get('ok', 0)) != 1:
                     empty_streak += 1
                     if empty_streak >= 2:
-                        delay = 90
-                        logger.warning(u'关键词"%s"连续返回空结果/错误(ok!=1)，可能触发风控。将延时%d秒，请在浏览器完成验证以刷新 Cookie：%s',
-                                       keyword,
-                                       delay,
-                                       'https://passport.weibo.com/sso/signin?entry=wapsso&source=wapssowb&url=https://m.weibo.cn/')
+                        delay = 5
+                        logger.warning(u'关键词"%s"连续返回空结果/错误(ok!=1)，可能触发风控。将延时%d秒后继续', keyword, delay)
                         for i in tqdm(range(delay)):
                             await asyncio.sleep(1)
-                        break
+                        if self.rotate_on_block and self.proxies:
+                            self._advance_proxy()
+                        empty_streak = 0
+                        page += 1
+                        continue
                     page += 1
                     continue
                 cards = data.get('data', {}).get('cards', [])
@@ -197,14 +211,15 @@ class Spider:
                 if not mblogs:
                     empty_streak += 1
                     if empty_streak >= 2:
-                        delay = 90
-                        logger.warning(u'关键词"%s"连续空页(无搜索结果)，可能触发风控。将延时%d秒，请在浏览器完成验证以刷新 Cookie：%s',
-                                       keyword,
-                                       delay,
-                                       'https://passport.weibo.com/sso/signin?entry=wapsso&source=wapssowb&url=https://m.weibo.cn/')
+                        delay = 5
+                        logger.warning(u'关键词"%s"连续空页(无搜索结果)，可能触发风控。将延时%d秒后继续', keyword, delay)
                         for i in tqdm(range(delay)):
                             await asyncio.sleep(1)
-                        break
+                        if self.rotate_on_block and self.proxies:
+                            self._advance_proxy()
+                        empty_streak = 0
+                        page += 1
+                        continue
                     page += 1
                     continue
                 empty_streak = 0
@@ -218,13 +233,10 @@ class Spider:
                         w.keyword = keyword
                         # 文本字段去标签
                         text_html = mb.get('text') or ''
-                        try:
-                            from lxml import etree as _etree
-                            node = _etree.HTML('<div>%s</div>' % text_html)
-                            text_plain = node.xpath('string(.)') if node is not None else text_html
-                        except Exception:
-                            text_plain = text_html
+                        text_plain = self._clean_html_to_text(text_html)
                         w.content = text_plain
+                        page_info = mb.get('page_info') or {}
+                        w.article_url = page_info.get('page_url') or page_info.get('url') or ''
                         w.original = False if mb.get('retweeted_status') else True
                         w.publish_time = mb.get('created_at') or ''
                         w.publish_tool = mb.get('source') or ''
@@ -234,12 +246,15 @@ class Spider:
                         pics = mb.get('pics') or []
                         pic_urls = []
                         for p in pics:
-                            url = p.get('url') or p.get('large', {}).get('url') or ''
+                            url = ''
+                            if isinstance(p, str):
+                                url = p
+                            elif isinstance(p, dict):
+                                url = p.get('url') or (p.get('large') or {}).get('url') or ''
                             if url:
                                 pic_urls.append(url)
                         w.original_pictures = ','.join(pic_urls) if pic_urls else '无'
                         w.retweet_pictures = '无'
-                        page_info = mb.get('page_info') or {}
                         media_info = page_info.get('media_info') or {}
                         w.video_url = media_info.get('stream_url') or media_info.get('mp4_sd_url') or ''
                         weibos.append(w)
@@ -271,7 +286,9 @@ class Spider:
             url = f'https://m.weibo.cn/comments/hotflow?id={weibo_id}&mid={weibo_id}'
             user_agent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/86.0.4240.111 Safari/537.36'
             headers = {'User-Agent': user_agent, 'Cookie': self.cookie}
-            async with self.session.get(url, headers=headers) as resp:
+            if sum(self.per_request_jitter_seconds) > 0:
+                await asyncio.sleep(random.uniform(*self.per_request_jitter_seconds))
+            async with self.session.get(url, headers=headers, proxy=self.current_proxy) as resp:
                 if resp.status != 200:
                     return []
                 data = None
@@ -291,12 +308,7 @@ class Spider:
                     cid = str(c.get('id') or '')
                     user = (c.get('user') or {}).get('screen_name') or ''
                     text_html = c.get('text') or ''
-                    try:
-                        from lxml import etree as _etree
-                        node = _etree.HTML('<div>%s</div>' % text_html)
-                        content = node.xpath('string(.)') if node is not None else text_html
-                    except Exception:
-                        content = text_html
+                    content = self._clean_html_to_text(text_html)
                     likes = int(c.get('like_count') or 0)
                     comments.append({
                         'original_post_id': weibo_id,
@@ -312,6 +324,81 @@ class Spider:
         except Exception as e:
             logger.exception(e)
             return []
+
+    async def fetch_full_weibo_text(self, weibo_id, force_extend=False):
+        try:
+            if sum(self.per_request_jitter_seconds) > 0:
+                await asyncio.sleep(random.uniform(*self.per_request_jitter_seconds))
+            ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/86.0.4240.111 Safari/537.36'
+            headers = {'User-Agent': ua, 'Cookie': self.cookie}
+            url_show = f'https://m.weibo.cn/statuses/show?id={weibo_id}'
+            async with self.session.get(url_show, headers=headers, proxy=self.current_proxy) as resp:
+                if resp.status != 200:
+                    return ''
+                data = None
+                try:
+                    data = await resp.json()
+                except Exception:
+                    t = await resp.text()
+                    try:
+                        import json as _json
+                        data = _json.loads(t)
+                    except Exception:
+                        data = None
+            if not data:
+                return ''
+            d = data.get('data') or {}
+            is_long = bool(d.get('isLongText'))
+            text_html = d.get('text') or ''
+            content_plain = self._clean_html_to_text(text_html)
+            if is_long or force_extend:
+                await asyncio.sleep(random.uniform(1.5, 3.5))
+                if sum(self.per_request_jitter_seconds) > 0:
+                    await asyncio.sleep(random.uniform(*self.per_request_jitter_seconds))
+                url_ext = f'https://m.weibo.cn/statuses/extend?id={weibo_id}'
+                headers2 = {'User-Agent': ua, 'Cookie': self.cookie, 'Referer': f'https://m.weibo.cn/detail/{weibo_id}'}
+                async with self.session.get(url_ext, headers=headers2, proxy=self.current_proxy) as resp2:
+                    if resp2.status == 200:
+                        ext = None
+                        try:
+                            ext = await resp2.json()
+                        except Exception:
+                            tt = await resp2.text()
+                            try:
+                                import json as _json
+                                ext = _json.loads(tt)
+                            except Exception:
+                                ext = None
+                        if ext:
+                            long_html = (ext.get('data') or {}).get('longTextContent') or ''
+                            if long_html:
+                                content_plain = self._clean_html_to_text(long_html)
+            return content_plain
+        except Exception as e:
+            logger.exception(e)
+            return ''
+
+    def _advance_proxy(self):
+        if not self.proxies:
+            return
+        self.proxy_index = (self.proxy_index + 1) % len(self.proxies)
+        self.current_proxy = self.proxies[self.proxy_index]
+        logger.warning(u'代理已切换: %s', self.current_proxy)
+    def _clean_html_to_text(self, html_text):
+        try:
+            s = html_text or ''
+            s = re.sub(r'(?is)<(script|style)[^>]*>.*?</\\1>', '', s)
+            s = re.sub(r'(?i)<br\\s*/?>', '\n', s)
+            s = re.sub(r'(?i)</p>', '\n', s)
+            s = re.sub(r'(?is)<span[^>]*class=["\\\']url-icon["\\\'][^>]*>.*?</span>', '', s)
+            s = re.sub(r'(?is)</?[^>]+>', '', s)
+            s = html.unescape(s)
+            s = s.replace('网页链接', '')
+            s = re.sub(r'[ \\t\\r\\f]+', ' ', s)
+            s = re.sub(r'\\n{2,}', '\\n', s)
+            return s.strip()
+        except Exception:
+            return (html_text or '').strip()
 
     def _get_filepath(self, type):
         """获取结果文件路径"""

@@ -283,6 +283,8 @@ JSONL 单行嵌套结构示例：
   "weibo_details": {
     "id": "5273208732254281",
     "text": "正文文本",
+    "full_text": "展开后的完整正文（如有）",
+    "publish_time": "Tue Jan 20 10:47:03 +0800 2026",
     "author": "昵称",
     "stats": { "up": 10, "re": 5, "cm": 2 }
   },
@@ -297,6 +299,68 @@ JSONL 单行嵌套结构示例：
   ]
 }
 ```
+
+## 辅助脚本与后处理 (Tools)
+
+**获取完整正文与时间**
+- 脚本: scripts/enrich_full_text.sh
+- 功能: 读取 JSONL，按 weibo_details.id 调用接口补齐 weibo_details.full_text 与 weibo_details.publish_time
+- 特性:
+  - 断点续跑：输出已存在时跳过已处理 id，追加写入
+  - 实时写入：每行处理后立即 flush，便于 tail 观察
+  - 进度条：显示待处理行进度
+- 用法:
+  - 默认路径
+    - bash scripts/enrich_full_text.sh
+  - 指定输入/输出
+    - bash scripts/enrich_full_text.sh <输入.jsonl> <输出.jsonl>
+  - 指定 Cookie（不传则读取当前目录 config.json）
+    - bash scripts/enrich_full_text.sh <输入.jsonl> <输出.jsonl> '你的Cookie字符串'
+
+**修复未展开的 badcase**
+- 脚本: scripts/repair_bad_full_text.sh
+- 作用: 仅对含“全文/…全文/网页链接”且 full_text 为空或等于清洗后 text 的记录，重试调用接口补齐
+- 目标文件: output_new_medical_generate_AI、output_new_medical_AI 两份 with_full_text.jsonl
+- 用法:
+  - bash scripts/repair_bad_full_text.sh
+  - 可选传 Cookie，同上
+
+**拆分缺失发布时间的记录**
+- 脚本: scripts/split_bad_publish_time.sh
+- 作用: 将没有 weibo_details.publish_time 的记录拆分到同名 _bad_case 目录，同名文件；原文件保留有时间的记录
+- 用法:
+  - bash scripts/split_bad_publish_time.sh
+
+## 反爬与稳健性 (Anti-bot & Robustness)
+
+- 请求抖动与延迟
+  - 每次请求前随机延迟（配置 per_request_jitter_seconds）
+  - 调用 extend 接口前固定 1.5–3.5 秒冷却
+- 代理池轮换（可选）
+  - config.json 支持：
+    ```json
+    {
+      "proxies": ["http://user:pass@host1:port", "http://host2:port"],
+      "rotate_on_block": true
+    }
+    ```
+  - 连续空页/错误时自动切换到下一个代理
+- 解析健壮性
+  - 图片字段同时支持字符串与字典格式（url 或 large.url）
+  - 爬虫阶段不再展开全文，仅输出清洗后的短文本；全文由后处理脚本补齐
+
+## 数据发布 (Hugging Face)
+
+- 仓库: https://huggingface.co/datasets/Logistic12/weiboDataWithCommentByTheme/tree/main
+- 命名约定:
+  - 主题前缀 + all_weibo_with_comments_with_full_text.jsonl
+  - 例如:
+    - medical_AI_all_weibo_with_comments_with_full_text.jsonl
+    - medical_generate_AI_all_weibo_with_comments_with_full_text.jsonl
+    - medical_AI_seen_all_weibo_with_comments_with_full_text.jsonl
+- 说明:
+  - 文件名中的 .with_full_text.jsonl 统一改为 _with_full_text.jsonl
+  - 可按主题目录或前缀组织，便于加载与区分
 
 ## 评论抓取配置 (Comment Settings)
 

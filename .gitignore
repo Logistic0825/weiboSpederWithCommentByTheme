@@ -14,3 +14,7 @@ weibo.db
 *.log
 
 .idea
+ 
+# Ignore generated data/output folders
+output*/
+weibo_old/
